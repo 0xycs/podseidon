@@ -15,6 +15,7 @@
 package pprutil
 
 import (
+	"math"
 	"sort"
 	"time"
 
@@ -28,6 +29,98 @@ import (
 
 func GetAggregationSelector(ppr *podseidonv1a1.PodProtector) metav1.LabelSelector {
 	return ptr.Deref(ppr.Spec.AggregationSelector, ppr.Spec.Selector)
+}
+
+// RecoveredOrphanCellID identifies admission history whose original worker cell was not persisted.
+// Real worker cell IDs are URL path components and therefore cannot contain the slash used here.
+// No aggregator owns this cell; operators must remove it explicitly after confirming all workers
+// have observed the historical admission events.
+const RecoveredOrphanCellID = "podseidon.kubewharf.io/recovered-orphans"
+
+// RecoverOrphanedCellStatuses removes cell statuses created without a cell ID by older webhooks.
+// Admission history from those statuses is conservatively moved to RecoveredOrphanCellID so that
+// a real cell's aggregator cannot discard history originating from another worker. Empty orphaned
+// cells are removed without creating the recovery cell. The caller should summarize the PPR
+// immediately afterwards, compacting recovered history before writing status.
+//
+// initializationTime supplies the recovery cell's required aggregation timestamp. It is not used
+// as an aggregation watermark because no aggregator owns the recovery cell.
+func RecoverOrphanedCellStatuses(
+	ppr *podseidonv1a1.PodProtector,
+	initializationTime time.Time,
+) bool {
+	firstOrphanIndex := findCellStatus(ppr.Status.Cells, "")
+	if firstOrphanIndex == -1 {
+		return false
+	}
+
+	retainedCells, recoveredBuckets := extractOrphanedCellStatuses(ppr.Status.Cells, firstOrphanIndex)
+	ppr.Status.Cells = retainedCells
+
+	if len(recoveredBuckets) == 0 {
+		return true
+	}
+
+	targetIndex := findCellStatus(ppr.Status.Cells, RecoveredOrphanCellID)
+	if targetIndex == -1 {
+		ppr.Status.Cells = append(ppr.Status.Cells, podseidonv1a1.PodProtectorCellStatus{
+			CellId: RecoveredOrphanCellID,
+		})
+		targetIndex = len(ppr.Status.Cells) - 1
+	}
+
+	target := &ppr.Status.Cells[targetIndex]
+	if target.Aggregation.LastEventTime.IsZero() {
+		target.Aggregation.LastEventTime = metav1.MicroTime{Time: initializationTime}
+	}
+
+	target.History.Buckets = append(target.History.Buckets, recoveredBuckets...)
+
+	return true
+}
+
+func extractOrphanedCellStatuses(
+	cells []podseidonv1a1.PodProtectorCellStatus,
+	firstOrphanIndex int,
+) ([]podseidonv1a1.PodProtectorCellStatus, []podseidonv1a1.PodProtectorAdmissionBucket) {
+	retainedCellCount := firstOrphanIndex
+	recoveredBucketCount := 0
+	for index := firstOrphanIndex; index < len(cells); index++ {
+		cell := &cells[index]
+		if cell.CellId != "" {
+			retainedCellCount++
+		} else {
+			recoveredBucketCount += len(cell.History.Buckets)
+		}
+	}
+
+	retainedCells := make([]podseidonv1a1.PodProtectorCellStatus, firstOrphanIndex, retainedCellCount)
+	copy(retainedCells, cells[:firstOrphanIndex])
+
+	recoveredBuckets := make([]podseidonv1a1.PodProtectorAdmissionBucket, 0, recoveredBucketCount)
+
+	for index := firstOrphanIndex; index < len(cells); index++ {
+		cell := &cells[index]
+		if cell.CellId != "" {
+			retainedCells = append(retainedCells, *cell)
+
+			continue
+		}
+
+		recoveredBuckets = append(recoveredBuckets, cell.History.Buckets...)
+	}
+
+	return retainedCells, recoveredBuckets
+}
+
+func findCellStatus(cells []podseidonv1a1.PodProtectorCellStatus, cellID string) int {
+	for index := range cells {
+		if cells[index].CellId == cellID {
+			return index
+		}
+	}
+
+	return -1
 }
 
 // Reconcile the .status field of a PodProtector.
@@ -103,9 +196,17 @@ func CompactBuckets(
 		}
 
 		compactBucket := &(*buckets)[0]
+		if compactBucket.Counter == nil {
+			compactBucket.Counter = ptr.To(int32(1))
+		}
+		if compactBucket.EndTime == nil {
+			compactBucket.EndTime = ptr.To(compactBucket.StartTime)
+		}
 
 		for bucketId := 1; bucketId <= delta; bucketId++ {
 			bucket := (*buckets)[bucketId]
+
+			addBucketCount(compactBucket.Counter, ptr.Deref(bucket.Counter, 1))
 
 			bucketEndTime := bucket.StartTime.Time
 			if bucket.EndTime != nil {
@@ -122,5 +223,15 @@ func CompactBuckets(
 		copyCount := len(*buckets) - 1 - delta
 		copy((*buckets)[1:copyCount+1], (*buckets)[delta+1:])
 		*buckets = (*buckets)[:copyCount+1]
+	}
+}
+
+func addBucketCount(total *int32, increment int32) {
+	increment = max(0, increment)
+
+	if *total > math.MaxInt32-increment {
+		*total = math.MaxInt32
+	} else {
+		*total += increment
 	}
 }

@@ -642,25 +642,6 @@ func tryReconcile(
 		}
 	}
 
-	status := util.GetOrAppendSliceWith(
-		&ppr.Status.Cells,
-		func(status *podseidonv1a1.PodProtectorCellStatus) bool { return status.CellId == options.myCellId },
-		func() podseidonv1a1.PodProtectorCellStatus {
-			return podseidonv1a1.PodProtectorCellStatus{CellId: options.myCellId}
-		},
-	)
-
-	requeue := optional.None[time.Duration]()
-	hasChange := haschange.New[observer.StatusChangeCause]()
-
-	if err := aggregateStatus(ctx, options.clk, obs, relevantPods, ppr, &requeue, &status.Aggregation, &hasChange); err != nil {
-		return observer.EndReconcile{
-			Err:       err,
-			HasChange: haschange.New[observer.StatusChangeCause](),
-			Action:    "",
-		}
-	}
-
 	lastEventTimeByShard := make([]time.Time, len(caches.podInformerShards))
 
 	for shardNumber, shard := range caches.podInformerShards {
@@ -680,6 +661,29 @@ func tryReconcile(
 	}
 
 	minLastEventTime := iter.FromSlice(lastEventTimeByShard).Extremum(time.Time.After).MustGet("number of shards is nonzero")
+	recoveredOrphans := pprutil.RecoverOrphanedCellStatuses(ppr, minLastEventTime)
+
+	status := util.GetOrAppendSliceWith(
+		&ppr.Status.Cells,
+		func(status *podseidonv1a1.PodProtectorCellStatus) bool { return status.CellId == options.myCellId },
+		func() podseidonv1a1.PodProtectorCellStatus {
+			return podseidonv1a1.PodProtectorCellStatus{CellId: options.myCellId}
+		},
+	)
+
+	requeue := optional.None[time.Duration]()
+	hasChange := haschange.New[observer.StatusChangeCause]()
+	if recoveredOrphans {
+		hasChange.Add(observer.StatusChangeCauseRecoveredOrphans)
+	}
+
+	if err := aggregateStatus(ctx, options.clk, obs, relevantPods, ppr, &requeue, &status.Aggregation, &hasChange); err != nil {
+		return observer.EndReconcile{
+			Err:       err,
+			HasChange: haschange.New[observer.StatusChangeCause](),
+			Action:    "",
+		}
+	}
 
 	updateLastEventTime(
 		caches, queueItem, status, &hasChange,

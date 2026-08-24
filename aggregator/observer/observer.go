@@ -70,6 +70,7 @@ const (
 	StatusChangeCauseScheduled
 	StatusChangeCauseCreated
 	StatusChangeCauseHistoryBucketAggregated
+	StatusChangeCauseRecoveredOrphans
 )
 
 func (cause StatusChangeCause) BitToString() string {
@@ -86,6 +87,8 @@ func (cause StatusChangeCause) BitToString() string {
 		return "Created"
 	case StatusChangeCauseHistoryBucketAggregated:
 		return "HistoryBucketAggregated"
+	case StatusChangeCauseRecoveredOrphans:
+		return "RecoveredOrphans"
 	default:
 		panic("receiver is not a power of 2")
 	}

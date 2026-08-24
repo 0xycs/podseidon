@@ -118,6 +118,8 @@ func (adapter PoolAdapter) tryExecute(
 
 	ppr := originalPpr.DeepCopy()
 	config := adapter.defaultConfig.Compute(optional.Some(ppr.Spec.AdmissionHistoryConfig))
+	executeTime := adapter.clock.Now()
+	pprutil.RecoverOrphanedCellStatuses(ppr, executeTime)
 	pprutil.Summarize(config, ppr)
 
 	results := make([]batchitem.Result, len(args))
@@ -131,14 +133,9 @@ func (adapter PoolAdapter) tryExecute(
 		cellId  string
 	}
 
-	executeTime := adapter.clock.Now()
-
 	undetermined := make([]undeterminedItem, 0, len(args))
 	for argIndex, arg := range args {
-		cellStatus := util.GetOrAppend(
-			&ppr.Status.Cells,
-			func(cell *podseidonv1a1.PodProtectorCellStatus) bool { return cell.CellId == arg.CellId },
-		)
+		cellStatus := getOrAppendCellStatus(&ppr.Status.Cells, arg.CellId, executeTime)
 
 		duplicateBucket := util.FindInSliceWith(
 			cellStatus.History.Buckets,
@@ -241,6 +238,25 @@ func (adapter PoolAdapter) tryExecute(
 
 	return retrybatch.ExecuteResultSuccess(
 		func(i int) batchitem.Result { return results[i] },
+	)
+}
+
+func getOrAppendCellStatus(
+	cells *[]podseidonv1a1.PodProtectorCellStatus,
+	cellID string,
+	initializationTime time.Time,
+) *podseidonv1a1.PodProtectorCellStatus {
+	return util.GetOrAppendSliceWith(
+		cells,
+		func(cell *podseidonv1a1.PodProtectorCellStatus) bool { return cell.CellId == cellID },
+		func() podseidonv1a1.PodProtectorCellStatus {
+			return podseidonv1a1.PodProtectorCellStatus{
+				CellId: cellID,
+				Aggregation: podseidonv1a1.PodProtectorAggregation{
+					LastEventTime: metav1.MicroTime{Time: initializationTime},
+				},
+			}
+		},
 	)
 }
 
